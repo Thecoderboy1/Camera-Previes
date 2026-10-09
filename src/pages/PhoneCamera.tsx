@@ -1,14 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Camera, SwitchCamera, Square, Shield, Radio, AlertTriangle, ArrowLeft } from 'lucide-react';
-import { SignalingChannel, TransportType, isStaticHosting } from '../lib/signaling';
+import { SignalingChannel, TransportType, SignalingMode, isStaticHosting } from '../lib/signaling';
 import { WebRTCManager } from '../lib/webrtc';
 import clsx from 'clsx';
 
 interface PhoneCameraProps {
   sessionId: string;
+  initialBackendUrl?: string;
+  initialMode?: string;
 }
 
-export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
+export default function PhoneCamera({ sessionId, initialBackendUrl = '', initialMode = '' }: PhoneCameraProps) {
   const [streamState, setStreamState] = useState<'idle' | 'requesting' | 'streaming' | 'error'>('idle');
   const [transport, setTransport] = useState<TransportType>('disconnected');
   const [isViewerConnected, setIsViewerConnected] = useState(false);
@@ -144,10 +146,10 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
           if (videoTrack) {
             peerEngine.replaceTrack(videoTrack);
           }
-        } else if (isStaticHosting() || sig.getTransport() === 'cloud-peer') {
+        } else if (sig.isCloudPeerMode() || sig.getTransport() === 'cloud-peer') {
           await sig.connectCloudPeer(sessionId, stream);
         } else {
-          // Local backend mode
+          // Dedicated backend mode (FastAPI / Express)
           if (rtcManagerRef.current && rtcManagerRef.current.getConnectionState() === 'connected') {
             const videoTrack = stream.getVideoTracks()[0];
             if (videoTrack) {
@@ -180,8 +182,22 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
 
   // Signaling setup
   useEffect(() => {
-    const savedMode = (localStorage.getItem('luma_signaling_mode') as any) || (isStaticHosting() ? 'cloud' : 'auto');
-    const customUrl = localStorage.getItem('luma_backend_url') || '';
+    const envBackendUrl = (import.meta.env.VITE_BACKEND_URL as string) || '';
+    const effectiveBackendUrl = initialBackendUrl || localStorage.getItem('luma_backend_url') || envBackendUrl;
+
+    let effectiveMode: SignalingMode = 'auto';
+    if (initialMode === 'cloud') {
+      effectiveMode = 'cloud';
+    } else if (initialMode === 'local' || effectiveBackendUrl) {
+      effectiveMode = 'local';
+    } else {
+      const savedMode = localStorage.getItem('luma_signaling_mode') as SignalingMode;
+      if (savedMode) {
+        effectiveMode = savedMode;
+      } else {
+        effectiveMode = isStaticHosting() ? 'cloud' : 'auto';
+      }
+    }
 
     const sig = new SignalingChannel(
       'camera',
@@ -217,14 +233,14 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
           setErrorMessage(msg);
         }
       },
-      savedMode,
-      customUrl
+      effectiveMode,
+      effectiveBackendUrl
     );
 
     signalingRef.current = sig;
 
-    // In local backend mode, connect immediately to notify viewer
-    if (!isStaticHosting() && savedMode !== 'cloud') {
+    // Connect immediately in backend mode to announce presence
+    if (!sig.isCloudPeerMode()) {
       sig.connect(sessionId);
     }
 
@@ -241,7 +257,7 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
       stopStreaming();
       sig.disconnect();
     };
-  }, [sessionId, stopStreaming, streamState, requestWakeLock]);
+  }, [sessionId, initialBackendUrl, initialMode, stopStreaming, streamState, requestWakeLock]);
 
   return (
     <div className="fixed inset-0 bg-[#0B0C0F] text-[#F4F5F7] flex flex-col font-sans select-none overflow-hidden">
@@ -271,7 +287,7 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
               )}
             />
             <span className="text-[#969BA7]">
-              {isViewerConnected || streamState === 'streaming' ? 'Connected' : 'Ready to stream'}
+              {isViewerConnected || streamState === 'streaming' ? 'Connected to Mac' : 'Ready to stream'}
             </span>
           </div>
         </div>

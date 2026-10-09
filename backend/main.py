@@ -1,24 +1,45 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+import os
 import secrets
 import json
 import asyncio
 import time
 from typing import Dict, Optional, List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="Luma Monitor Signaling Server")
+# Configurable environment variables
+PORT = int(os.getenv("PORT", 8000))
+HOST = os.getenv("HOST", "0.0.0.0")
+ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", 3600))  # 1 hour
+INACTIVITY_TTL_SECONDS = int(os.getenv("INACTIVITY_TTL_SECONDS", 900))  # 15 minutes
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Luma Monitor Signaling Server",
+    description="WebSocket & HTTP WebRTC Signaling Backend for Luma Monitor",
+    version="1.1.0"
 )
 
-SESSION_TTL_SECONDS = 3600  # 1 hour
-INACTIVITY_TTL_SECONDS = 900  # 15 minutes
+# Parse CORS origins
+if ALLOWED_ORIGINS_STR == "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_origin_regex=r"https?://.*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    allowed_list = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 class Session:
     def __init__(self, session_id: str, token: str):
@@ -40,15 +61,15 @@ class Session:
         return time.time() > self.expires_at
 
     def is_inactive(self) -> bool:
-        has_connections = self.viewer_ws or self.camera_ws or bool(self.sse_queues)
-        return not has_connections and ((time.time() - self.last_activity) > INACTIVITY_TTL_SECONDS)
+        has_connections = (self.viewer_ws is not None) or (self.camera_ws is not None) or bool(self.sse_queues)
+        return (not has_connections) and ((time.time() - self.last_activity) > INACTIVITY_TTL_SECONDS)
 
 class ConnectionManager:
     def __init__(self):
         self.sessions: Dict[str, Session] = {}
 
     def create_session(self) -> Session:
-        session_id = secrets.token_hex(3).upper()
+        session_id = secrets.token_hex(3).upper()  # 6-character random hex
         token = secrets.token_hex(16)
         session = Session(session_id, token)
         self.sessions[session_id] = session
@@ -90,7 +111,7 @@ class ConnectionManager:
             except Exception:
                 pass
 
-        # Polling buffers
+        # Message buffer for HTTP polling
         if target_role in ("viewer", "all"):
             session.viewer_messages.append(message)
             if len(session.viewer_messages) > 50:
@@ -123,6 +144,7 @@ async def schedule_periodic_cleanup():
 def health_check():
     return {
         "status": "ok",
+        "service": "luma-monitor-backend",
         "active_sessions": len(manager.sessions),
         "timestamp": int(time.time() * 1000)
     }
@@ -231,6 +253,7 @@ async def end_session(session_id: str):
     return {"success": True}
 
 @app.websocket("/ws")
+@app.websocket("/ws/")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     current_session_id = None
@@ -245,6 +268,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             msg_type = data.get("type")
+
+            # Keepalive ping/pong
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong", "timestamp": int(time.time() * 1000)})
+                continue
 
             if msg_type == "create_session":
                 session = manager.create_session()
@@ -305,3 +333,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif current_role == "viewer":
                     session.viewer_ws = None
                     await manager.broadcast(session, "camera", {"type": "viewer_left"})
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"Starting Luma Monitor Backend on {HOST}:{PORT}")
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=True)

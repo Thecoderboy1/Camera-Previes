@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Camera, Settings, HelpCircle, X, Server, Cloud, Check } from 'lucide-react';
+import { Camera, Settings, HelpCircle, X, Server, Cloud, Check, ExternalLink, Activity } from 'lucide-react';
 import { SignalingChannel, TransportType, SignalingMode, isStaticHosting } from '../lib/signaling';
 import { WebRTCManager, StreamStats } from '../lib/webrtc';
 import { VideoPreview, VideoState } from '../components/VideoPreview';
@@ -18,14 +18,18 @@ export default function DesktopDashboard() {
   const [showHelp, setShowHelp] = useState(false);
 
   // Settings state
+  const envBackendUrl = (import.meta.env.VITE_BACKEND_URL as string) || '';
   const [signalingMode, setSignalingMode] = useState<SignalingMode>(() => {
     const saved = localStorage.getItem('luma_signaling_mode') as SignalingMode;
     if (saved) return saved;
+    if (envBackendUrl) return 'local';
     return isStaticHosting() ? 'cloud' : 'auto';
   });
   const [customBackendUrl, setCustomBackendUrl] = useState(() => {
-    return localStorage.getItem('luma_backend_url') || '';
+    return localStorage.getItem('luma_backend_url') || envBackendUrl;
   });
+  const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'failed'>('idle');
+  const [testMessage, setTestMessage] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
 
   const signalingRef = useRef<SignalingChannel | null>(null);
@@ -68,6 +72,18 @@ export default function DesktopDashboard() {
     return rtc;
   }, []);
 
+  const buildPairingUrl = useCallback((newSessionId: string, currentMode: SignalingMode, backendUrl: string) => {
+    const url = new URL(window.location.origin);
+    url.searchParams.set('session', newSessionId);
+    if (backendUrl) {
+      url.searchParams.set('backend', backendUrl);
+    }
+    if (currentMode === 'cloud') {
+      url.searchParams.set('mode', 'cloud');
+    }
+    return url.toString();
+  }, []);
+
   const startSession = useCallback(async () => {
     // Teardown previous
     if (rtcManagerRef.current) {
@@ -89,8 +105,8 @@ export default function DesktopDashboard() {
       {
         onSessionCreated: (newSessionId) => {
           setSessionId(newSessionId);
-          const url = `${window.location.origin}/?session=${newSessionId}`;
-          setPairingUrl(url);
+          const generatedUrl = buildPairingUrl(newSessionId, signalingMode, customBackendUrl);
+          setPairingUrl(generatedUrl);
           setState('waiting_for_phone');
         },
         onJoined: (joinedId) => {
@@ -153,7 +169,7 @@ export default function DesktopDashboard() {
 
     signalingRef.current = sig;
     await sig.createSession();
-  }, [setupWebRTC, signalingMode, customBackendUrl, state]);
+  }, [setupWebRTC, signalingMode, customBackendUrl, buildPairingUrl, state]);
 
   const endSession = useCallback(async () => {
     if (signalingRef.current) {
@@ -171,6 +187,33 @@ export default function DesktopDashboard() {
     setState('idle');
   }, []);
 
+  const testBackendConnection = async () => {
+    const targetUrl = customBackendUrl.replace(/\/$/, '');
+    if (!targetUrl) {
+      setTestStatus('failed');
+      setTestMessage('Please enter a backend URL (e.g. http://192.168.1.50:8000 or https://your-backend.onrender.com)');
+      return;
+    }
+
+    setTestStatus('testing');
+    setTestMessage('Pinging /health endpoint...');
+
+    try {
+      const res = await fetch(`${targetUrl}/health`, { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setTestStatus('success');
+        setTestMessage(`Connected! Server status: ${data.status || 'ok'}`);
+      } else {
+        setTestStatus('failed');
+        setTestMessage(`Server returned HTTP ${res.status}: ${res.statusText}`);
+      }
+    } catch (err: any) {
+      setTestStatus('failed');
+      setTestMessage(`Could not reach server (${err.message || 'Network Error'}). Check if backend is running and CORS is enabled.`);
+    }
+  };
+
   const saveSettings = () => {
     localStorage.setItem('luma_signaling_mode', signalingMode);
     localStorage.setItem('luma_backend_url', customBackendUrl);
@@ -179,7 +222,7 @@ export default function DesktopDashboard() {
       setSettingsSaved(false);
       setShowSettings(false);
       startSession();
-    }, 800);
+    }, 600);
   };
 
   useEffect(() => {
@@ -274,16 +317,26 @@ export default function DesktopDashboard() {
       </main>
 
       {/* Bottom Status Bar */}
-      <StatusBar state={state} stats={stats} />
+      <StatusBar
+        state={state}
+        stats={stats}
+        connectionMethod={
+          transport === 'cloud-peer'
+            ? 'Cloud WebRTC (P2P Mesh)'
+            : transport === 'websocket'
+            ? 'Persistent WSS Backend'
+            : 'Local Wi-Fi Signaling'
+        }
+      />
 
       {/* Settings Modal */}
       {showSettings && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#111318] border border-[#292C34] rounded-xl max-w-md w-full p-6 shadow-2xl">
+          <div className="bg-[#111318] border border-[#292C34] rounded-xl max-w-lg w-full p-6 shadow-2xl">
             <div className="flex items-center justify-between mb-5">
               <h3 className="text-sm font-medium text-[#F4F5F7] flex items-center gap-2">
                 <Settings className="w-4 h-4 text-[#A3E635]" />
-                Connection & Network Settings
+                Connection & Backend Architecture
               </h3>
               <button
                 onClick={() => setShowSettings(false)}
@@ -295,7 +348,7 @@ export default function DesktopDashboard() {
 
             <div className="space-y-4 text-xs text-[#969BA7]">
               <div>
-                <label className="text-[#F4F5F7] font-medium block mb-1.5">Signaling Provider</label>
+                <label className="text-[#F4F5F7] font-medium block mb-1.5">Signaling Architecture</label>
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     type="button"
@@ -311,7 +364,7 @@ export default function DesktopDashboard() {
                       <span>Cloud WebRTC</span>
                     </div>
                     <span className="text-[10px] text-[#969BA7] leading-tight">
-                      Zero backend. Works directly on Netlify & static hosts.
+                      Zero backend needed. Ideal for Netlify, Vercel & static hosting.
                     </span>
                   </button>
 
@@ -326,35 +379,63 @@ export default function DesktopDashboard() {
                   >
                     <div className="flex items-center gap-1.5 font-medium">
                       <Server className="w-3.5 h-3.5 text-blue-400" />
-                      <span>Local Backend</span>
+                      <span>Dedicated Backend</span>
                     </div>
                     <span className="text-[10px] text-[#969BA7] leading-tight">
-                      Uses Python FastAPI / Express on your local Mac.
+                      Connects to Python FastAPI backend (Render, Railway, or local Mac).
                     </span>
                   </button>
                 </div>
               </div>
 
               {signalingMode === 'local' && (
-                <div>
-                  <label className="text-[#F4F5F7] font-medium block mb-1">Custom Backend URL (Optional)</label>
+                <div className="bg-[#17191F] p-3.5 rounded-lg border border-[#292C34] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[#F4F5F7] font-medium">FastAPI Backend URL</label>
+                    <button
+                      type="button"
+                      onClick={testBackendConnection}
+                      disabled={testStatus === 'testing'}
+                      className="text-[11px] text-[#A3E635] hover:underline flex items-center gap-1"
+                    >
+                      <Activity className="w-3 h-3" />
+                      Test Connection
+                    </button>
+                  </div>
+
                   <input
                     type="text"
                     value={customBackendUrl}
-                    onChange={(e) => setCustomBackendUrl(e.target.value)}
-                    placeholder="e.g. http://192.168.1.50:8000 or tunnel URL"
-                    className="w-full bg-[#17191F] border border-[#292C34] text-[#F4F5F7] px-3 py-2 rounded-lg font-mono text-xs outline-none focus:border-[#A3E635]"
+                    onChange={(e) => {
+                      setCustomBackendUrl(e.target.value);
+                      setTestStatus('idle');
+                    }}
+                    placeholder="e.g. https://luma-backend.onrender.com or http://192.168.1.50:8000"
+                    className="w-full bg-[#111318] border border-[#292C34] text-[#F4F5F7] px-3 py-2 rounded-lg font-mono text-xs outline-none focus:border-[#A3E635]"
                   />
-                  <p className="mt-1 text-[10px] text-[#969BA7]">
-                    Leave blank to use current origin. If hosting frontend on Netlify while running Python backend on Mac, enter your Mac's IP or tunnel URL.
+
+                  {testStatus !== 'idle' && (
+                    <div className={`p-2 rounded text-[11px] ${
+                      testStatus === 'success'
+                        ? 'bg-[#A3E635]/10 text-[#A3E635] border border-[#A3E635]/20'
+                        : testStatus === 'testing'
+                        ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20'
+                        : 'bg-[#F87171]/10 text-[#F87171] border border-[#F87171]/20'
+                    }`}>
+                      {testMessage}
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-[#969BA7] leading-relaxed">
+                    Set this if your frontend is deployed on Vercel/Netlify while the Python backend runs separately on Render, Railway, Fly.io, or your Mac. Leave blank to connect to same-origin.
                   </p>
                 </div>
               )}
 
-              <div>
-                <span className="text-[#F4F5F7] font-medium block mb-1">Current Active Transport</span>
+              <div className="border-t border-[#292C34] pt-3">
+                <span className="text-[#F4F5F7] font-medium block mb-1">Active Signaling Transport</span>
                 <div className="bg-[#17191F] p-2.5 rounded border border-[#292C34] text-[11px] flex items-center justify-between">
-                  <span>Signaling Transport:</span>
+                  <span>Current Transport:</span>
                   <span className="font-mono text-[#F4F5F7] font-medium uppercase">{transport}</span>
                 </div>
               </div>

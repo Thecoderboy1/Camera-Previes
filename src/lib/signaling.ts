@@ -1,7 +1,8 @@
 /**
  * Unified Signaling Engine for Luma Monitor
- * Supports Cloud PeerJS WebRTC (ideal for Netlify & static hosts)
- * and Local Backend (FastAPI / Express via WebSocket + SSE)
+ * Supports:
+ * 1. Dedicated Python FastAPI / Node Backend (WebSockets + REST + SSE) via VITE_BACKEND_URL or local server
+ * 2. Cloud PeerJS WebRTC (zero-setup fallback when deployed to static hosts without backend)
  */
 
 import { PeerSignalingEngine } from './peerSignaling';
@@ -42,6 +43,7 @@ export class SignalingChannel {
   private ws: WebSocket | null = null;
   private eventSource: EventSource | null = null;
   private pollInterval: number | null = null;
+  private pingInterval: number | null = null;
   private peerEngine: PeerSignalingEngine | null = null;
   private role: SignalingRole;
   private sessionId: string | null = null;
@@ -51,11 +53,19 @@ export class SignalingChannel {
   private mode: SignalingMode;
   private customBackendUrl: string = '';
 
-  constructor(role: SignalingRole, callbacks: SignalingCallbacks = {}, mode: SignalingMode = 'auto', customBackendUrl = '') {
+  constructor(
+    role: SignalingRole,
+    callbacks: SignalingCallbacks = {},
+    mode: SignalingMode = 'auto',
+    customBackendUrl = ''
+  ) {
     this.role = role;
     this.callbacks = callbacks;
     this.mode = mode;
-    this.customBackendUrl = customBackendUrl.replace(/\/$/, '');
+
+    const envBackend = (import.meta.env.VITE_BACKEND_URL as string) || '';
+    const rawUrl = customBackendUrl || envBackend;
+    this.customBackendUrl = rawUrl ? rawUrl.replace(/\/$/, '') : '';
   }
 
   private setTransport(transport: TransportType) {
@@ -73,23 +83,45 @@ export class SignalingChannel {
     return this.peerEngine;
   }
 
-  private shouldUseCloudPeer(): boolean {
+  public isCloudPeerMode(): boolean {
+    return this.shouldUseCloudPeer();
+  }
+
+  public shouldUseCloudPeer(): boolean {
     if (this.mode === 'cloud') return true;
     if (this.mode === 'local') return false;
-    // Auto mode: use Cloud Peer on Netlify / static hosts, or if no custom backend is set
+
+    // Auto mode:
+    // If backend URL is explicitly configured, use the backend!
+    if (this.getBaseApiUrl()) {
+      return false;
+    }
+
+    // Otherwise, if running on a static host like Netlify or Vercel, default to Cloud Peer
     return isStaticHosting();
   }
 
-  private getBaseApiUrl(): string {
-    return this.customBackendUrl || '';
+  public getBaseApiUrl(): string {
+    return this.customBackendUrl;
   }
 
-  private getWsUrl(): string {
-    if (this.customBackendUrl) {
-      const url = new URL(this.customBackendUrl);
-      const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${wsProtocol}//${url.host}/ws`;
+  public getWsUrl(): string {
+    const envWs = import.meta.env.VITE_WS_URL as string;
+    if (envWs) {
+      return envWs.endsWith('/ws') ? envWs : `${envWs.replace(/\/$/, '')}/ws`;
     }
+
+    const base = this.getBaseApiUrl();
+    if (base) {
+      try {
+        const url = new URL(base);
+        const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${wsProtocol}//${url.host}/ws`;
+      } catch {
+        // Fallback below
+      }
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}/ws`;
   }
@@ -102,19 +134,26 @@ export class SignalingChannel {
       return this.createCloudPeerSession();
     }
 
+    const baseApi = this.getBaseApiUrl();
+    const endpoint = baseApi ? `${baseApi}/api/sessions` : '/api/sessions';
+
     try {
-      const response = await fetch(`${this.getBaseApiUrl()}/api/sessions`, {
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
 
       if (!response.ok) {
-        // If 404 (e.g. deployed on Netlify or backend not found), fall back to Cloud Peer
-        if (response.status === 404 || response.status === 502) {
+        // If 404 on a static host without a configured backend, gracefully fall back
+        if ((response.status === 404 || response.status === 502) && !baseApi && isStaticHosting()) {
           console.info('No backend server detected at origin, switching to Cloud WebRTC signaling.');
           return this.createCloudPeerSession();
         }
-        throw new Error('Failed to create session on server');
+
+        const errText = await response.text().catch(() => '');
+        throw new Error(
+          `Backend returned ${response.status} (${response.statusText}): ${errText || 'Failed to create session on server'}`
+        );
       }
 
       const data = await response.json();
@@ -122,10 +161,16 @@ export class SignalingChannel {
       this.callbacks.onSessionCreated?.(data.sessionId, data.token || '');
       this.connect(data.sessionId);
       return data.sessionId;
-    } catch {
-      // Graceful fallback to Cloud Peer WebRTC
-      console.info('Backend unreachable, using Cloud WebRTC peer signaling.');
-      return this.createCloudPeerSession();
+    } catch (err: any) {
+      // If user did not specify a custom backend and is on a static host, fallback
+      if (!baseApi && isStaticHosting()) {
+        console.info('Backend unreachable, using Cloud WebRTC peer signaling.');
+        return this.createCloudPeerSession();
+      }
+
+      const msg = err?.message || 'Failed to connect to backend server';
+      this.callbacks.onError?.(`${msg}. Check backend URL (${baseApi || 'same origin'}) and ensure the FastAPI server is running.`);
+      return '';
     }
   }
 
@@ -173,7 +218,7 @@ export class SignalingChannel {
       return;
     }
 
-    // Try WebSocket with local backend
+    // Try WebSocket with configured/local backend
     this.connectWs(this.sessionId);
   }
 
@@ -217,7 +262,7 @@ export class SignalingChannel {
           ws.close();
           this.fallbackFromWs(sessionId);
         }
-      }, 3000);
+      }, 4000);
 
       ws.onopen = () => {
         clearTimeout(connectionTimeout);
@@ -229,6 +274,14 @@ export class SignalingChannel {
           sessionId,
           role: this.role
         }));
+
+        // Keepalive ping every 25 seconds
+        if (this.pingInterval) clearInterval(this.pingInterval);
+        this.pingInterval = window.setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25000);
       };
 
       ws.onmessage = (event) => {
@@ -244,6 +297,10 @@ export class SignalingChannel {
 
       ws.onclose = () => {
         clearTimeout(connectionTimeout);
+        if (this.pingInterval) {
+          clearInterval(this.pingInterval);
+          this.pingInterval = null;
+        }
         this.ws = null;
         if (!this.isDestroyed) {
           this.fallbackFromWs(sessionId);
@@ -257,13 +314,13 @@ export class SignalingChannel {
   private fallbackFromWs(sessionId: string) {
     if (this.isDestroyed) return;
 
-    // If static hosting, prefer cloud peer directly
-    if (isStaticHosting()) {
+    // If static hosting with no backend, prefer cloud peer directly
+    if (isStaticHosting() && !this.getBaseApiUrl()) {
       this.setTransport('cloud-peer');
       return;
     }
 
-    // Try SSE
+    // Try SSE on configured backend
     this.connectHttpFallback(sessionId);
   }
 
@@ -275,8 +332,10 @@ export class SignalingChannel {
       this.eventSource = null;
     }
 
+    const base = this.getBaseApiUrl();
+    const sseUrl = `${base}/api/sessions/${encodeURIComponent(sessionId)}/events?role=${encodeURIComponent(this.role)}`;
+
     try {
-      const sseUrl = `${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(sessionId)}/events?role=${encodeURIComponent(this.role)}`;
       const es = new EventSource(sseUrl);
       this.eventSource = es;
 
@@ -300,12 +359,47 @@ export class SignalingChannel {
           this.eventSource.close();
           this.eventSource = null;
         }
-        // If SSE fails (like 404 on Netlify), switch to Cloud Peer
-        this.setTransport('cloud-peer');
+        if (!base && isStaticHosting()) {
+          this.setTransport('cloud-peer');
+        } else {
+          this.startPolling(sessionId);
+        }
       };
     } catch {
-      this.setTransport('cloud-peer');
+      this.startPolling(sessionId);
     }
+  }
+
+  private startPolling(sessionId: string) {
+    if (this.pollInterval || this.isDestroyed) return;
+    this.setTransport('polling');
+    this.callbacks.onConnect?.();
+
+    const base = this.getBaseApiUrl();
+
+    if (this.role === 'camera') {
+      this.callbacks.onJoined?.(sessionId);
+      fetch(`${base}/api/sessions/${encodeURIComponent(sessionId)}/signal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'camera', type: 'camera_joined' })
+      }).catch(() => {});
+    }
+
+    this.pollInterval = window.setInterval(async () => {
+      if (this.isDestroyed || !this.sessionId) return;
+      try {
+        const res = await fetch(`${base}/api/sessions/${encodeURIComponent(sessionId)}/messages?role=${encodeURIComponent(this.role)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.messages && Array.isArray(data.messages)) {
+            for (const msg of data.messages) {
+              this.handleIncomingMessage(msg);
+            }
+          }
+        }
+      } catch {}
+    }, 1200);
   }
 
   private handleIncomingMessage(msg: any) {
@@ -347,7 +441,6 @@ export class SignalingChannel {
 
   public async sendSignal(payload: any) {
     if (this.transport === 'cloud-peer') {
-      // PeerJS handles signaling internally
       return;
     }
 
@@ -363,8 +456,9 @@ export class SignalingChannel {
       return;
     }
 
+    const base = this.getBaseApiUrl();
     try {
-      await fetch(`${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(this.sessionId)}/signal`, {
+      await fetch(`${base}/api/sessions/${encodeURIComponent(this.sessionId)}/signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -390,8 +484,9 @@ export class SignalingChannel {
       }));
     }
 
+    const base = this.getBaseApiUrl();
     try {
-      await fetch(`${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(this.sessionId)}/end`, {
+      await fetch(`${base}/api/sessions/${encodeURIComponent(this.sessionId)}/end`, {
         method: 'POST'
       });
     } catch {}
@@ -404,6 +499,10 @@ export class SignalingChannel {
     if (this.peerEngine) {
       this.peerEngine.disconnect();
       this.peerEngine = null;
+    }
+    if (this.pingInterval !== null) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
     }
     if (this.ws) {
       this.ws.close();
