@@ -1,99 +1,141 @@
 # Luma Monitor
 
-Luma Monitor is a web application that allows you to use your Android phone as a wireless camera and view its live feed on your Mac.
+Luma Monitor is a minimal camera monitor that allows a user to use their Android phone as a wireless camera and view its live feed on their Mac through a browser with low-latency WebRTC peer-to-peer streaming.
 
-It uses WebRTC for real-time video streaming directly between your phone and Mac, and a WebSocket signaling server to negotiate the connection.
+---
+
+## Technology Stack
+
+- **Frontend**: React 19, TypeScript, Vite, Tailwind CSS.
+- **Backend**: Python 3 with FastAPI (and full Node.js Express companion engine).
+- **Real-Time Video**: Browser-native WebRTC (`RTCPeerConnection`).
+- **Signaling**: Resilient dual-transport engine (WebSocket with seamless SSE/HTTP fallback).
+- **Pairing**: Dynamic QR codes and 6-character session identifiers.
+
+---
 
 ## macOS Setup Instructions
 
-Follow these exact steps to run the application locally on your Mac.
+Follow these exact terminal commands to run the application locally on macOS.
 
-### Prerequisites
+### 1. Requirements
+- **macOS**: Sonoma, Ventura, or Monterey
+- **Python**: Python 3.9+ (Check with `python3 --version`)
+- **Node.js**: Node 18+ or 20+ (Check with `node -v`)
+- **Android Phone**: On the same local Wi-Fi network as the Mac
 
-- **Python 3.9+**: For running the FastAPI backend.
-- **Node.js 18+**: For building the frontend.
-- **Android Phone**: Must be on the same Wi-Fi network as the Mac.
+---
 
-### 1. Start the Python Backend
+### 2. Find Your Mac's Local IP Address
+On your Mac, find your Wi-Fi IP address by running:
+```bash
+ipconfig getifaddr en0
+```
+*(If you are connected via Ethernet instead of Wi-Fi, try `en1` or `en2`).*
+Note this address down (e.g., `192.168.1.50`).
 
-The backend handles WebRTC signaling (exchanging session IDs, offers, and ICE candidates).
+---
 
-1. Open your Terminal.
-2. Navigate to the backend directory:
+### 3. Handle macOS Firewall Permissions
+To allow your Android phone to reach your Mac over local Wi-Fi:
+1. Open **System Settings > Network > Firewall**.
+2. If Firewall is turned on, click **Options...**.
+3. Ensure **"Automatically allow built-in software to receive incoming connections"** and **"Automatically allow downloaded signed software to receive incoming connections"** are checked.
+4. When prompted by macOS to allow `Python` or `Node` to accept incoming network connections, click **Allow**.
+
+---
+
+### 4. Running the Python FastAPI Backend
+
+Open a terminal on your Mac:
+
+```bash
+# 1. Navigate to the backend directory
+cd backend
+
+# 2. Create and activate a Python virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install backend dependencies
+pip install -r requirements.txt
+
+# 4. Start the FastAPI signaling server on port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Verify that the health check responds:
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","active_sessions":0,...}
+```
+
+---
+
+### 5. Running the Frontend with Secure Mobile Context (HTTPS)
+
+> **Important**: Android Chrome and mobile browsers **strictly require a secure context (`HTTPS`)** for camera permissions (`navigator.mediaDevices.getUserMedia`). Opening a plain `http://192.168.x.x` URL on Android will block the camera prompt.
+
+#### Option A: Cloudflare Tunnel or LocalTunnel (Recommended for Easy Setup)
+In a new terminal window:
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Start the development server
+npm run dev
+```
+
+In another terminal, expose port 3000 via a secure tunnel:
+```bash
+npx localtunnel --port 3000
+# Output: your url is: https://funny-otter-42.loca.lt
+```
+Open that secure `https://...` URL in your Mac browser.
+
+#### Option B: Vite Basic SSL (Pure Local Network)
+1. Install the SSL plugin:
    ```bash
-   cd backend
+   npm install -D @vitejs/plugin-basic-ssl
    ```
-3. (Optional) Create a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-4. Install the requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
-5. Run the FastAPI server:
-   ```bash
-   uvicorn main:app --host 0.0.0.0 --port 8000
-   ```
-   *Note: `0.0.0.0` allows the server to accept connections from other devices on your local network.*
-
-### 2. Configure the Frontend
-
-The frontend needs to know where the backend is running.
-
-1. Open a new Terminal tab.
-2. Navigate to the project root directory.
-3. Install dependencies:
-   ```bash
-   npm install
-   ```
-4. If you are running the frontend via standard Vite (without the included Express server), you may need to configure the proxy in `vite.config.ts`. However, for this project, an integrated Node.js `server.ts` is provided for the AI Studio environment, but you can also simply run:
-   ```bash
-   npm run dev
-   ```
-   This will start the local development server on port `3000`.
-
-### 3. HTTPS and Local Network Access (Crucial)
-
-Android browsers **require a secure context (HTTPS)** to access the camera (`getUserMedia`). If you access the frontend using a standard HTTP IP address (e.g., `http://192.168.1.5:3000`), the phone will block camera access.
-
-**Option A: LocalTunnel / Ngrok (Easiest)**
-Use a tunneling tool to expose your local port securely to the internet.
-1. Install localtunnel: `npm install -g localtunnel`
-2. Run the tunnel pointing to the frontend port:
-   ```bash
-   lt --port 3000
-   ```
-3. Open the provided `https://...loca.lt` URL on your Mac browser.
-4. Create a session, and scan the QR code with your phone. Since the URL is HTTPS, the Android browser will allow camera access.
-
-**Option B: Vite Basic SSL**
-If you prefer to stay purely local, configure Vite to use SSL.
-1. Install the plugin: `npm install @vitejs/plugin-basic-ssl -D`
-2. Update `vite.config.ts`:
+2. Enable it in `vite.config.ts`:
    ```typescript
-   import basicSsl from '@vitejs/plugin-basic-ssl'
+   import basicSsl from '@vitejs/plugin-basic-ssl';
    export default defineConfig({
-     plugins: [react(), basicSsl()]
-   })
+     plugins: [react(), basicSsl()],
+     server: { host: '0.0.0.0', port: 3000 }
+   });
    ```
-3. Run `npm run dev -- --host`. Access via `https://192.168.x.x:3000`. You will need to click "Advanced -> Proceed" on both devices to bypass the self-signed certificate warning.
+3. Run `npm run dev`. Navigate to `https://<YOUR-MAC-IP>:3000` on both Mac and phone, accepting the local self-signed certificate warning once.
 
-### 4. Connect Your Android Phone
+---
 
-1. Once the dashboard is open on your Mac (via HTTPS tunnel or SSL), it will automatically create a session and display a QR code.
-2. Open your Android phone's camera app and scan the QR code.
-3. Tap the link to open it in Chrome.
-4. Tap **Allow camera access**.
-5. The video feed will instantly appear on your Mac.
+### 6. Connect Your Android Phone
 
-### Troubleshooting
+1. Open the Luma Monitor dashboard on your Mac.
+2. A unique pairing session and QR code will appear automatically.
+3. Open your Android phone's camera app or Google Lens and scan the QR code.
+4. Tap the link to open the Luma Camera page in Chrome.
+5. Tap **Allow camera access**.
+6. The phone begins streaming immediately, displaying the live feed in the Mac preview window.
+7. Use the flip button on your phone to toggle between front and rear cameras without breaking the connection.
+8. Toggle fullscreen or video fit mode on your Mac.
 
-- **No Camera Permission Prompt on Phone**: Ensure you opened an `https://` URL on the phone, not `http://`.
-- **QR Code Doesn't Load**: Check your firewall settings on Mac to ensure Node/Python can accept incoming connections.
-- **Video Stays Black**: Ensure both devices are on the same Wi-Fi. Some corporate or public Wi-Fi networks block WebRTC or P2P connections; in this case, a TURN server would be required (currently uses Google's public STUN server).
+---
 
-### Stopping the Server
+### 7. How to Stop the Servers
 
-Press `Ctrl+C` in both terminal tabs to stop the Python and Node.js servers.
+To stop the servers at any time:
+- In the Python terminal: Press `Ctrl + C`.
+- In the Frontend terminal: Press `Ctrl + C`.
+
+---
+
+### 8. Troubleshooting
+
+| Issue | Cause | Solution |
+|---|---|---|
+| Camera permission button does nothing on phone | Page loaded over plain HTTP | Android requires HTTPS. Use the provided tunnel or local SSL certificate. |
+| QR code URL cannot be reached from phone | Firewall or different Wi-Fi network | Verify both devices are on the same Wi-Fi SSID and run `ipconfig getifaddr en0`. Check macOS Firewall settings. |
+| Video preview stays black | Symmetric NAT or firewall blocking UDP | STUN handles most residential Wi-Fi networks. If on an enterprise router, configure a TURN relay server. |
+| Session shows disconnected | Phone screen slept | Luma Monitor automatically activates the Screen Wake Lock API. Keep the browser tab in foreground. |
