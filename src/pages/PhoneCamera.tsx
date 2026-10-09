@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Camera, SwitchCamera, Square, Shield, Radio, AlertTriangle, ArrowLeft } from 'lucide-react';
-import { SignalingChannel, TransportType } from '../lib/signaling';
+import { SignalingChannel, TransportType, isStaticHosting } from '../lib/signaling';
 import { WebRTCManager } from '../lib/webrtc';
 import clsx from 'clsx';
 
@@ -137,14 +137,25 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
 
       const sig = signalingRef.current;
       if (sig) {
-        // If peer connection exists, replace track
-        if (rtcManagerRef.current && rtcManagerRef.current.getConnectionState() === 'connected') {
+        const peerEngine = sig.getPeerEngine();
+        if (peerEngine) {
+          // If already streaming via Cloud Peer, replace track
           const videoTrack = stream.getVideoTracks()[0];
           if (videoTrack) {
-            await rtcManagerRef.current.replaceVideoTrack(videoTrack);
+            peerEngine.replaceTrack(videoTrack);
           }
+        } else if (isStaticHosting() || sig.getTransport() === 'cloud-peer') {
+          await sig.connectCloudPeer(sessionId, stream);
         } else {
-          await initiatePeerConnection(stream, sig);
+          // Local backend mode
+          if (rtcManagerRef.current && rtcManagerRef.current.getConnectionState() === 'connected') {
+            const videoTrack = stream.getVideoTracks()[0];
+            if (videoTrack) {
+              await rtcManagerRef.current.replaceVideoTrack(videoTrack);
+            }
+          } else {
+            await initiatePeerConnection(stream, sig);
+          }
         }
       }
     } catch (err: any) {
@@ -157,7 +168,7 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
         setErrorMessage(err.message || 'Could not start camera feed.');
       }
     }
-  }, [facingMode, initiatePeerConnection, requestWakeLock]);
+  }, [facingMode, sessionId, initiatePeerConnection, requestWakeLock]);
 
   const switchCamera = useCallback(() => {
     const nextFacingMode = facingMode === 'user' ? 'environment' : 'user';
@@ -169,41 +180,53 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
 
   // Signaling setup
   useEffect(() => {
-    const sig = new SignalingChannel('camera', {
-      onJoined: () => {
-        setIsViewerConnected(true);
-      },
-      onViewerLeft: () => {
-        setIsViewerConnected(false);
-      },
-      onSignal: async (payload) => {
-        const rtc = rtcManagerRef.current;
-        if (!rtc) return;
+    const savedMode = (localStorage.getItem('luma_signaling_mode') as any) || (isStaticHosting() ? 'cloud' : 'auto');
+    const customUrl = localStorage.getItem('luma_backend_url') || '';
 
-        try {
-          if (payload.type === 'answer') {
-            await rtc.handleAnswer(payload);
-          } else if (payload.type === 'candidate' && payload.candidate) {
-            await rtc.addIceCandidate(payload.candidate);
+    const sig = new SignalingChannel(
+      'camera',
+      {
+        onJoined: () => {
+          setIsViewerConnected(true);
+        },
+        onViewerLeft: () => {
+          setIsViewerConnected(false);
+        },
+        onSignal: async (payload) => {
+          const rtc = rtcManagerRef.current;
+          if (!rtc) return;
+
+          try {
+            if (payload.type === 'answer') {
+              await rtc.handleAnswer(payload);
+            } else if (payload.type === 'candidate' && payload.candidate) {
+              await rtc.addIceCandidate(payload.candidate);
+            }
+          } catch (e: any) {
+            console.warn('WebRTC signal handling warning:', e?.message);
           }
-        } catch (e: any) {
-          console.warn('WebRTC signal handling warning:', e?.message);
+        },
+        onSessionEnded: () => {
+          stopStreaming();
+          setErrorMessage('The Mac host ended the session.');
+        },
+        onTransportChange: (newTransport) => {
+          setTransport(newTransport);
+        },
+        onError: (msg) => {
+          setErrorMessage(msg);
         }
       },
-      onSessionEnded: () => {
-        stopStreaming();
-        setErrorMessage('The Mac host ended the session.');
-      },
-      onTransportChange: (newTransport) => {
-        setTransport(newTransport);
-      },
-      onError: (msg) => {
-        setErrorMessage(msg);
-      }
-    });
+      savedMode,
+      customUrl
+    );
 
     signalingRef.current = sig;
-    sig.connect(sessionId);
+
+    // In local backend mode, connect immediately to notify viewer
+    if (!isStaticHosting() && savedMode !== 'cloud') {
+      sig.connect(sessionId);
+    }
 
     // Handle tab visibility change
     const handleVisibility = () => {
@@ -244,11 +267,11 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
             <span
               className={clsx(
                 'w-1.5 h-1.5 rounded-full',
-                isViewerConnected ? 'bg-[#A3E635]' : 'bg-amber-400'
+                isViewerConnected || streamState === 'streaming' ? 'bg-[#A3E635]' : 'bg-amber-400'
               )}
             />
             <span className="text-[#969BA7]">
-              {isViewerConnected ? 'Paired with Mac' : 'Connecting'}
+              {isViewerConnected || streamState === 'streaming' ? 'Connected' : 'Ready to stream'}
             </span>
           </div>
         </div>
@@ -287,7 +310,7 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
             </div>
 
             <h1 className="text-lg font-medium text-[#F4F5F7] mb-2 tracking-tight">
-              {streamState === 'error' ? 'Connection Issue' : 'Connect to your Mac'}
+              {streamState === 'error' ? 'Connection Notice' : 'Connect to your Mac'}
             </h1>
 
             {streamState === 'error' ? (
@@ -314,11 +337,11 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
                   className="w-full bg-[#A3E635] hover:bg-[#84CC16] text-[#0B0C0F] py-3.5 rounded-xl font-medium text-sm flex items-center justify-center gap-2 transition-colors shadow-sm disabled:opacity-50 active:scale-[0.98]"
                 >
                   <Camera className="w-4 h-4" />
-                  {streamState === 'requesting' ? 'Requesting Camera...' : 'Allow camera access'}
+                  {streamState === 'requesting' ? 'Starting Camera...' : 'Allow camera access'}
                 </button>
 
                 <p className="text-[11px] text-[#969BA7]/70 mt-4 leading-relaxed">
-                  The browser will prompt for camera access. Stream is transmitted directly to your Mac and is never recorded or stored.
+                  The browser will prompt for camera access. Video stream is encrypted end-to-end and never stored.
                 </p>
               </>
             )}
@@ -365,11 +388,11 @@ export default function PhoneCamera({ sessionId }: PhoneCameraProps) {
       {/* Mobile Footer Status */}
       <footer className="h-7 border-t border-[#292C34] bg-[#111318] px-4 flex items-center justify-between text-[11px] text-[#969BA7] shrink-0">
         <div className="flex items-center gap-1.5">
-          <Radio className={clsx('w-3 h-3', transport === 'websocket' ? 'text-[#A3E635]' : 'text-blue-400')} />
-          <span>{transport.toUpperCase()}</span>
+          <Radio className={clsx('w-3 h-3', transport === 'cloud-peer' || transport === 'websocket' ? 'text-[#A3E635]' : 'text-blue-400')} />
+          <span>{transport === 'cloud-peer' ? 'CLOUD WEBRTC' : transport.toUpperCase()}</span>
         </div>
         <div>
-          {wakeLockActive ? 'Screen Awake' : 'Normal Standby'}
+          {wakeLockActive ? 'Screen Awake' : 'Standby'}
         </div>
       </footer>
     </div>

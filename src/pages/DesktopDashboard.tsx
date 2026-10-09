@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Camera, Settings, HelpCircle, X, ExternalLink, ShieldCheck } from 'lucide-react';
-import { SignalingChannel, TransportType } from '../lib/signaling';
+import { Camera, Settings, HelpCircle, X, Server, Cloud, Check } from 'lucide-react';
+import { SignalingChannel, TransportType, SignalingMode, isStaticHosting } from '../lib/signaling';
 import { WebRTCManager, StreamStats } from '../lib/webrtc';
 import { VideoPreview, VideoState } from '../components/VideoPreview';
 import { PairingPanel } from '../components/PairingPanel';
@@ -16,6 +16,17 @@ export default function DesktopDashboard() {
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [showSettings, setShowSettings] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+
+  // Settings state
+  const [signalingMode, setSignalingMode] = useState<SignalingMode>(() => {
+    const saved = localStorage.getItem('luma_signaling_mode') as SignalingMode;
+    if (saved) return saved;
+    return isStaticHosting() ? 'cloud' : 'auto';
+  });
+  const [customBackendUrl, setCustomBackendUrl] = useState(() => {
+    return localStorage.getItem('luma_backend_url') || '';
+  });
+  const [settingsSaved, setSettingsSaved] = useState(false);
 
   const signalingRef = useRef<SignalingChannel | null>(null);
   const rtcManagerRef = useRef<WebRTCManager | null>(null);
@@ -73,65 +84,76 @@ export default function DesktopDashboard() {
     setState('idle');
     setErrorMessage('');
 
-    const sig = new SignalingChannel('viewer', {
-      onSessionCreated: (newSessionId) => {
-        setSessionId(newSessionId);
-        const url = `${window.location.origin}/?session=${newSessionId}`;
-        setPairingUrl(url);
-        setState('waiting_for_phone');
-      },
-      onJoined: (joinedId) => {
-        setSessionId(joinedId);
-        setState('waiting_for_phone');
-      },
-      onCameraJoined: () => {
-        setState('phone_connected');
-        setupWebRTC(sig);
-      },
-      onCameraLeft: () => {
-        setState('disconnected');
-        setRemoteStream(null);
-        setStats(null);
-        if (rtcManagerRef.current) {
-          rtcManagerRef.current.close();
-          rtcManagerRef.current = null;
-        }
-      },
-      onSignal: async (payload) => {
-        if (!rtcManagerRef.current) {
-          setupWebRTC(sig);
-        }
-        const rtc = rtcManagerRef.current!;
-
-        try {
-          if (payload.type === 'offer') {
-            setState('connecting');
-            const answer = await rtc.handleOffer(payload);
-            await sig.sendSignal(answer);
-          } else if (payload.type === 'candidate' && payload.candidate) {
-            await rtc.addIceCandidate(payload.candidate);
+    const sig = new SignalingChannel(
+      'viewer',
+      {
+        onSessionCreated: (newSessionId) => {
+          setSessionId(newSessionId);
+          const url = `${window.location.origin}/?session=${newSessionId}`;
+          setPairingUrl(url);
+          setState('waiting_for_phone');
+        },
+        onJoined: (joinedId) => {
+          setSessionId(joinedId);
+          setState('waiting_for_phone');
+        },
+        onCameraJoined: () => {
+          setState('phone_connected');
+          if (sig.getTransport() !== 'cloud-peer') {
+            setupWebRTC(sig);
           }
-        } catch (e: any) {
-          console.warn('WebRTC signal handling warning:', e?.message);
+        },
+        onRemoteStream: (stream) => {
+          setRemoteStream(stream);
+          setState('streaming');
+        },
+        onCameraLeft: () => {
+          setState('disconnected');
+          setRemoteStream(null);
+          setStats(null);
+          if (rtcManagerRef.current) {
+            rtcManagerRef.current.close();
+            rtcManagerRef.current = null;
+          }
+        },
+        onSignal: async (payload) => {
+          if (!rtcManagerRef.current) {
+            setupWebRTC(sig);
+          }
+          const rtc = rtcManagerRef.current!;
+
+          try {
+            if (payload.type === 'offer') {
+              setState('connecting');
+              const answer = await rtc.handleOffer(payload);
+              await sig.sendSignal(answer);
+            } else if (payload.type === 'candidate' && payload.candidate) {
+              await rtc.addIceCandidate(payload.candidate);
+            }
+          } catch (e: any) {
+            console.warn('WebRTC signal handling warning:', e?.message);
+          }
+        },
+        onError: (msg) => {
+          setState('error');
+          setErrorMessage(msg);
+        },
+        onTransportChange: (newTransport) => {
+          setTransport(newTransport);
+        },
+        onDisconnect: () => {
+          if (state === 'streaming') {
+            setState('reconnecting');
+          }
         }
       },
-      onError: (msg) => {
-        setState('error');
-        setErrorMessage(msg);
-      },
-      onTransportChange: (newTransport) => {
-        setTransport(newTransport);
-      },
-      onDisconnect: () => {
-        if (state === 'streaming') {
-          setState('reconnecting');
-        }
-      }
-    });
+      signalingMode,
+      customBackendUrl
+    );
 
     signalingRef.current = sig;
     await sig.createSession();
-  }, [setupWebRTC, state]);
+  }, [setupWebRTC, signalingMode, customBackendUrl, state]);
 
   const endSession = useCallback(async () => {
     if (signalingRef.current) {
@@ -149,6 +171,17 @@ export default function DesktopDashboard() {
     setState('idle');
   }, []);
 
+  const saveSettings = () => {
+    localStorage.setItem('luma_signaling_mode', signalingMode);
+    localStorage.setItem('luma_backend_url', customBackendUrl);
+    setSettingsSaved(true);
+    setTimeout(() => {
+      setSettingsSaved(false);
+      setShowSettings(false);
+      startSession();
+    }, 800);
+  };
+
   useEffect(() => {
     startSession();
 
@@ -160,7 +193,7 @@ export default function DesktopDashboard() {
 
   return (
     <div className="min-h-screen bg-[#0B0C0F] text-[#F4F5F7] flex flex-col font-sans selection:bg-[#A3E635] selection:text-[#0B0C0F]">
-      {/* Top Navigation Bar (approx 64px high) */}
+      {/* Top Navigation Bar */}
       <header className="h-16 border-b border-[#292C34] flex items-center justify-between px-6 bg-[#111318] shrink-0 select-none">
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-lg bg-[#17191F] border border-[#292C34] flex items-center justify-center">
@@ -170,7 +203,7 @@ export default function DesktopDashboard() {
             <div className="flex items-center gap-2">
               <span className="font-medium tracking-tight text-sm text-[#F4F5F7]">Luma Monitor</span>
               <span className="text-[10px] font-mono text-[#969BA7] bg-[#17191F] border border-[#292C34] px-1.5 py-0.5 rounded">
-                v1.0
+                v1.1
               </span>
             </div>
             <p className="text-[11px] text-[#969BA7]">Wireless Android Camera Monitor</p>
@@ -214,7 +247,7 @@ export default function DesktopDashboard() {
         </div>
       </header>
 
-      {/* Main Workspace (Two-column layout: approx 72% left, 28% right) */}
+      {/* Main Workspace */}
       <main className="flex-1 flex flex-col lg:flex-row overflow-hidden p-6 gap-6">
         {/* Left Column: Live Camera Preview (~72%) */}
         <div className="flex-1 flex flex-col min-w-0">
@@ -262,38 +295,92 @@ export default function DesktopDashboard() {
 
             <div className="space-y-4 text-xs text-[#969BA7]">
               <div>
-                <span className="text-[#F4F5F7] font-medium block mb-1">STUN Servers</span>
-                <p className="font-mono bg-[#17191F] p-2 rounded border border-[#292C34] text-[11px]">
-                  stun:stun.l.google.com:19302<br />
-                  stun:stun1.l.google.com:19302
-                </p>
-                <p className="mt-1 text-[11px]">
-                  STUN resolves public and LAN IP addresses. For isolated subnets or strict symmetrical NATs, a TURN relay can be configured.
-                </p>
-              </div>
+                <label className="text-[#F4F5F7] font-medium block mb-1.5">Signaling Provider</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSignalingMode('cloud')}
+                    className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all ${
+                      signalingMode === 'cloud'
+                        ? 'bg-[#17191F] border-[#A3E635] text-[#F4F5F7]'
+                        : 'bg-[#17191F]/50 border-[#292C34] text-[#969BA7] hover:border-[#383C47]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <Cloud className="w-3.5 h-3.5 text-[#A3E635]" />
+                      <span>Cloud WebRTC</span>
+                    </div>
+                    <span className="text-[10px] text-[#969BA7] leading-tight">
+                      Zero backend. Works directly on Netlify & static hosts.
+                    </span>
+                  </button>
 
-              <div>
-                <span className="text-[#F4F5F7] font-medium block mb-1">HTTPS Requirement for Mobile</span>
-                <div className="bg-[#17191F] p-2.5 rounded border border-[#292C34] text-[11px] leading-relaxed">
-                  Android Chrome requires a secure context (<span className="text-[#A3E635] font-mono">HTTPS</span>) to authorize camera access. On local networks, use the provided local tunnel or trusted local certificate.
+                  <button
+                    type="button"
+                    onClick={() => setSignalingMode('local')}
+                    className={`p-3 rounded-lg border text-left flex flex-col gap-1 transition-all ${
+                      signalingMode === 'local'
+                        ? 'bg-[#17191F] border-[#A3E635] text-[#F4F5F7]'
+                        : 'bg-[#17191F]/50 border-[#292C34] text-[#969BA7] hover:border-[#383C47]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <Server className="w-3.5 h-3.5 text-blue-400" />
+                      <span>Local Backend</span>
+                    </div>
+                    <span className="text-[10px] text-[#969BA7] leading-tight">
+                      Uses Python FastAPI / Express on your local Mac.
+                    </span>
+                  </button>
                 </div>
               </div>
 
+              {signalingMode === 'local' && (
+                <div>
+                  <label className="text-[#F4F5F7] font-medium block mb-1">Custom Backend URL (Optional)</label>
+                  <input
+                    type="text"
+                    value={customBackendUrl}
+                    onChange={(e) => setCustomBackendUrl(e.target.value)}
+                    placeholder="e.g. http://192.168.1.50:8000 or tunnel URL"
+                    className="w-full bg-[#17191F] border border-[#292C34] text-[#F4F5F7] px-3 py-2 rounded-lg font-mono text-xs outline-none focus:border-[#A3E635]"
+                  />
+                  <p className="mt-1 text-[10px] text-[#969BA7]">
+                    Leave blank to use current origin. If hosting frontend on Netlify while running Python backend on Mac, enter your Mac's IP or tunnel URL.
+                  </p>
+                </div>
+              )}
+
               <div>
-                <span className="text-[#F4F5F7] font-medium block mb-1">Signaling Engine</span>
+                <span className="text-[#F4F5F7] font-medium block mb-1">Current Active Transport</span>
                 <div className="bg-[#17191F] p-2.5 rounded border border-[#292C34] text-[11px] flex items-center justify-between">
-                  <span>Current Transport:</span>
+                  <span>Signaling Transport:</span>
                   <span className="font-mono text-[#F4F5F7] font-medium uppercase">{transport}</span>
                 </div>
               </div>
             </div>
 
-            <div className="mt-6 flex justify-end">
+            <div className="mt-6 flex justify-end gap-2">
               <button
+                type="button"
                 onClick={() => setShowSettings(false)}
-                className="bg-[#292C34] hover:bg-[#323640] text-[#F4F5F7] text-xs font-medium px-4 py-2 rounded-lg transition-colors"
+                className="bg-transparent hover:bg-[#17191F] text-[#969BA7] text-xs font-medium px-4 py-2 rounded-lg transition-colors border border-transparent"
               >
-                Close
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={saveSettings}
+                className="bg-[#A3E635] hover:bg-[#84CC16] text-[#0B0C0F] text-xs font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm"
+              >
+                {settingsSaved ? (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    Saved!
+                  </>
+                ) : (
+                  'Apply & Reconnect'
+                )}
               </button>
             </div>
           </div>
@@ -325,7 +412,7 @@ export default function DesktopDashboard() {
                 <strong className="text-[#F4F5F7]">Allow Camera Permission:</strong> Tap the "Allow camera access" button on your phone.
               </li>
               <li>
-                <strong className="text-[#F4F5F7]">Instant Live Stream:</strong> WebRTC will stream directly from phone to Mac at 720p/1080p with minimal latency.
+                <strong className="text-[#F4F5F7]">Instant Live Stream:</strong> WebRTC streams video directly from phone to Mac with minimal latency.
               </li>
               <li>
                 <strong className="text-[#F4F5F7]">Camera Switch:</strong> Use the flip icon on your phone to toggle between front and rear cameras without reconnecting.

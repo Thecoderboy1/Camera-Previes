@@ -1,10 +1,14 @@
 /**
- * Resilient Signaling Engine for Luma Monitor
- * Supports WebSocket as primary transport with seamless SSE/HTTP fallback
+ * Unified Signaling Engine for Luma Monitor
+ * Supports Cloud PeerJS WebRTC (ideal for Netlify & static hosts)
+ * and Local Backend (FastAPI / Express via WebSocket + SSE)
  */
 
+import { PeerSignalingEngine } from './peerSignaling';
+
 export type SignalingRole = 'viewer' | 'camera';
-export type TransportType = 'websocket' | 'sse' | 'polling' | 'disconnected';
+export type TransportType = 'cloud-peer' | 'websocket' | 'sse' | 'polling' | 'disconnected';
+export type SignalingMode = 'auto' | 'cloud' | 'local';
 
 export interface SignalingCallbacks {
   onSessionCreated?: (sessionId: string, token: string) => void;
@@ -13,6 +17,7 @@ export interface SignalingCallbacks {
   onCameraLeft?: () => void;
   onViewerLeft?: () => void;
   onSignal?: (payload: any) => void;
+  onRemoteStream?: (stream: MediaStream) => void;
   onSessionEnded?: () => void;
   onError?: (message: string) => void;
   onConnect?: () => void;
@@ -20,20 +25,37 @@ export interface SignalingCallbacks {
   onTransportChange?: (transport: TransportType) => void;
 }
 
+export function isStaticHosting(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname.toLowerCase();
+  return (
+    host.includes('netlify.app') ||
+    host.includes('vercel.app') ||
+    host.includes('github.io') ||
+    host.includes('surge.sh') ||
+    host.includes('firebaseapp.com') ||
+    host.includes('web.app')
+  );
+}
+
 export class SignalingChannel {
   private ws: WebSocket | null = null;
   private eventSource: EventSource | null = null;
   private pollInterval: number | null = null;
+  private peerEngine: PeerSignalingEngine | null = null;
   private role: SignalingRole;
   private sessionId: string | null = null;
   private callbacks: SignalingCallbacks;
   private isDestroyed = false;
   private transport: TransportType = 'disconnected';
-  private wsFailed = false;
+  private mode: SignalingMode;
+  private customBackendUrl: string = '';
 
-  constructor(role: SignalingRole, callbacks: SignalingCallbacks = {}) {
+  constructor(role: SignalingRole, callbacks: SignalingCallbacks = {}, mode: SignalingMode = 'auto', customBackendUrl = '') {
     this.role = role;
     this.callbacks = callbacks;
+    this.mode = mode;
+    this.customBackendUrl = customBackendUrl.replace(/\/$/, '');
   }
 
   private setTransport(transport: TransportType) {
@@ -47,7 +69,27 @@ export class SignalingChannel {
     return this.transport;
   }
 
+  public getPeerEngine(): PeerSignalingEngine | null {
+    return this.peerEngine;
+  }
+
+  private shouldUseCloudPeer(): boolean {
+    if (this.mode === 'cloud') return true;
+    if (this.mode === 'local') return false;
+    // Auto mode: use Cloud Peer on Netlify / static hosts, or if no custom backend is set
+    return isStaticHosting();
+  }
+
+  private getBaseApiUrl(): string {
+    return this.customBackendUrl || '';
+  }
+
   private getWsUrl(): string {
+    if (this.customBackendUrl) {
+      const url = new URL(this.customBackendUrl);
+      const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${wsProtocol}//${url.host}/ws`;
+    }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}/ws`;
   }
@@ -56,43 +98,115 @@ export class SignalingChannel {
    * Start session creation for viewer
    */
   public async createSession(): Promise<string> {
+    if (this.shouldUseCloudPeer()) {
+      return this.createCloudPeerSession();
+    }
+
     try {
-      const response = await fetch('/api/sessions', {
+      const response = await fetch(`${this.getBaseApiUrl()}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
-      if (!response.ok) throw new Error('Failed to create session on server');
+
+      if (!response.ok) {
+        // If 404 (e.g. deployed on Netlify or backend not found), fall back to Cloud Peer
+        if (response.status === 404 || response.status === 502) {
+          console.info('No backend server detected at origin, switching to Cloud WebRTC signaling.');
+          return this.createCloudPeerSession();
+        }
+        throw new Error('Failed to create session on server');
+      }
+
       const data = await response.json();
       this.sessionId = data.sessionId;
-      this.callbacks.onSessionCreated?.(data.sessionId, data.token);
-
-      // Now connect signaling for this session
+      this.callbacks.onSessionCreated?.(data.sessionId, data.token || '');
       this.connect(data.sessionId);
       return data.sessionId;
-    } catch (err: any) {
-      console.warn('REST session creation fallback error, trying WS:', err?.message);
-      // Try WebSocket create_session
-      this.connectWs(null);
-      return '';
+    } catch {
+      // Graceful fallback to Cloud Peer WebRTC
+      console.info('Backend unreachable, using Cloud WebRTC peer signaling.');
+      return this.createCloudPeerSession();
     }
+  }
+
+  private async createCloudPeerSession(): Promise<string> {
+    this.setTransport('cloud-peer');
+    this.peerEngine = new PeerSignalingEngine('viewer', {
+      onConnect: () => {
+        this.setTransport('cloud-peer');
+        this.callbacks.onConnect?.();
+      },
+      onSessionCreated: (id) => {
+        this.sessionId = id;
+        this.callbacks.onSessionCreated?.(id, 'cloud');
+      },
+      onCameraJoined: () => {
+        this.callbacks.onCameraJoined?.();
+      },
+      onCameraLeft: () => {
+        this.callbacks.onCameraLeft?.();
+      },
+      onRemoteStream: (stream) => {
+        this.callbacks.onRemoteStream?.(stream);
+      },
+      onDisconnect: () => {
+        this.setTransport('disconnected');
+        this.callbacks.onDisconnect?.();
+      },
+      onError: (msg) => {
+        this.callbacks.onError?.(msg);
+      }
+    });
+
+    return await this.peerEngine.startViewerSession();
   }
 
   /**
-   * Connect to an existing session
+   * Connect to an existing session (used by phone camera or viewer rejoin)
    */
-  public connect(sessionId: string) {
-    this.sessionId = sessionId;
+  public connect(sessionId: string, localStream?: MediaStream) {
+    this.sessionId = sessionId.toUpperCase();
     this.isDestroyed = false;
 
-    // Try WebSocket first unless already failed
-    if (!this.wsFailed) {
-      this.connectWs(sessionId);
-    } else {
-      this.connectHttpFallback(sessionId);
+    if (this.shouldUseCloudPeer()) {
+      this.connectCloudPeer(this.sessionId, localStream);
+      return;
+    }
+
+    // Try WebSocket with local backend
+    this.connectWs(this.sessionId);
+  }
+
+  public async connectCloudPeer(sessionId: string, localStream?: MediaStream) {
+    this.sessionId = sessionId.toUpperCase();
+    this.setTransport('cloud-peer');
+
+    if (this.role === 'camera' && localStream) {
+      this.peerEngine = new PeerSignalingEngine('camera', {
+        onConnect: () => {
+          this.setTransport('cloud-peer');
+          this.callbacks.onConnect?.();
+        },
+        onCameraJoined: () => {
+          this.callbacks.onJoined?.(sessionId);
+        },
+        onViewerLeft: () => {
+          this.callbacks.onViewerLeft?.();
+        },
+        onError: (msg) => {
+          this.callbacks.onError?.(msg);
+        },
+        onDisconnect: () => {
+          this.setTransport('disconnected');
+          this.callbacks.onDisconnect?.();
+        }
+      });
+
+      await this.peerEngine.startCameraStream(sessionId, localStream);
     }
   }
 
-  private connectWs(sessionId: string | null) {
+  private connectWs(sessionId: string) {
     try {
       const wsUrl = this.getWsUrl();
       const ws = new WebSocket(wsUrl);
@@ -100,75 +214,69 @@ export class SignalingChannel {
 
       const connectionTimeout = window.setTimeout(() => {
         if (ws.readyState !== WebSocket.OPEN) {
-          console.info('WebSocket connection timed out, switching to HTTP fallback.');
           ws.close();
-          this.wsFailed = true;
-          if (this.sessionId) this.connectHttpFallback(this.sessionId);
+          this.fallbackFromWs(sessionId);
         }
-      }, 3500);
+      }, 3000);
 
       ws.onopen = () => {
         clearTimeout(connectionTimeout);
         this.setTransport('websocket');
         this.callbacks.onConnect?.();
 
-        if (this.role === 'viewer') {
-          if (sessionId) {
-            ws.send(JSON.stringify({ type: 'join_session', sessionId, role: 'viewer' }));
-          } else {
-            ws.send(JSON.stringify({ type: 'create_session' }));
-          }
-        } else if (sessionId) {
-          ws.send(JSON.stringify({ type: 'join_session', sessionId, role: 'camera' }));
-        }
+        ws.send(JSON.stringify({
+          type: 'join_session',
+          sessionId,
+          role: this.role
+        }));
       };
 
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
           this.handleIncomingMessage(msg);
-        } catch (e) {
-          console.warn('WS parse warning:', e);
-        }
+        } catch {}
       };
 
       ws.onerror = () => {
         clearTimeout(connectionTimeout);
-        // Do not use console.error to avoid unhandled browser alert
-        console.info('WebSocket not available on this origin/proxy, transitioning to HTTP transport.');
-        this.wsFailed = true;
       };
 
       ws.onclose = () => {
         clearTimeout(connectionTimeout);
         this.ws = null;
-        if (!this.isDestroyed && this.sessionId) {
-          // Gracefully fallback to SSE/HTTP
-          this.setTransport('disconnected');
-          this.connectHttpFallback(this.sessionId);
-        } else {
-          this.setTransport('disconnected');
-          this.callbacks.onDisconnect?.();
+        if (!this.isDestroyed) {
+          this.fallbackFromWs(sessionId);
         }
       };
     } catch {
-      this.wsFailed = true;
-      if (sessionId) this.connectHttpFallback(sessionId);
+      this.fallbackFromWs(sessionId);
     }
+  }
+
+  private fallbackFromWs(sessionId: string) {
+    if (this.isDestroyed) return;
+
+    // If static hosting, prefer cloud peer directly
+    if (isStaticHosting()) {
+      this.setTransport('cloud-peer');
+      return;
+    }
+
+    // Try SSE
+    this.connectHttpFallback(sessionId);
   }
 
   private connectHttpFallback(sessionId: string) {
     if (this.isDestroyed) return;
-    this.sessionId = sessionId;
 
-    // Close any previous SSE
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;
     }
 
     try {
-      const sseUrl = `/api/sessions/${encodeURIComponent(sessionId)}/events?role=${encodeURIComponent(this.role)}`;
+      const sseUrl = `${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(sessionId)}/events?role=${encodeURIComponent(this.role)}`;
       const es = new EventSource(sseUrl);
       this.eventSource = es;
 
@@ -184,56 +292,20 @@ export class SignalingChannel {
         try {
           const msg = JSON.parse(event.data);
           this.handleIncomingMessage(msg);
-        } catch {
-          // Keepalive or unparseable ignored
-        }
+        } catch {}
       };
 
       es.onerror = () => {
-        // Fall back to polling if SSE is blocked
         if (this.eventSource) {
           this.eventSource.close();
           this.eventSource = null;
         }
-        if (!this.isDestroyed) {
-          this.startPolling(sessionId);
-        }
+        // If SSE fails (like 404 on Netlify), switch to Cloud Peer
+        this.setTransport('cloud-peer');
       };
     } catch {
-      this.startPolling(sessionId);
+      this.setTransport('cloud-peer');
     }
-  }
-
-  private startPolling(sessionId: string) {
-    if (this.pollInterval || this.isDestroyed) return;
-    this.setTransport('polling');
-    this.callbacks.onConnect?.();
-
-    if (this.role === 'camera') {
-      this.callbacks.onJoined?.(sessionId);
-      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/signal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'camera', type: 'camera_joined' })
-      }).catch(() => {});
-    }
-
-    this.pollInterval = window.setInterval(async () => {
-      if (this.isDestroyed || !this.sessionId) return;
-      try {
-        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?role=${encodeURIComponent(this.role)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.messages && Array.isArray(data.messages)) {
-            for (const msg of data.messages) {
-              this.handleIncomingMessage(msg);
-            }
-          }
-        }
-      } catch {
-        // Polling failure handled silently
-      }
-    }, 1000);
   }
 
   private handleIncomingMessage(msg: any) {
@@ -273,10 +345,12 @@ export class SignalingChannel {
     }
   }
 
-  /**
-   * Send a WebRTC signal (offer, answer, candidate)
-   */
   public async sendSignal(payload: any) {
+    if (this.transport === 'cloud-peer') {
+      // PeerJS handles signaling internally
+      return;
+    }
+
     if (!this.sessionId) return;
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -289,9 +363,8 @@ export class SignalingChannel {
       return;
     }
 
-    // HTTP POST fallback
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(this.sessionId)}/signal`, {
+      await fetch(`${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(this.sessionId)}/signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -299,15 +372,14 @@ export class SignalingChannel {
           payload
         })
       });
-    } catch (e: any) {
-      console.warn('Signal dispatch warning:', e?.message);
-    }
+    } catch {}
   }
 
-  /**
-   * End current session
-   */
   public async endSession() {
+    if (this.peerEngine) {
+      this.peerEngine.endSession();
+    }
+
     if (!this.sessionId) return;
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -319,18 +391,20 @@ export class SignalingChannel {
     }
 
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(this.sessionId)}/end`, {
+      await fetch(`${this.getBaseApiUrl()}/api/sessions/${encodeURIComponent(this.sessionId)}/end`, {
         method: 'POST'
       });
-    } catch {
-      // Ignored
-    }
+    } catch {}
 
     this.disconnect();
   }
 
   public disconnect() {
     this.isDestroyed = true;
+    if (this.peerEngine) {
+      this.peerEngine.disconnect();
+      this.peerEngine = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
