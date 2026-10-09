@@ -1,0 +1,6 @@
+{
+  "name": "Luma Monitor",
+  "description": "Wireless Android camera monitor for Mac.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
